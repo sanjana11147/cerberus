@@ -15,6 +15,7 @@ from collections import OrderedDict
 from typing import List, Tuple, Union
 
 import cv2
+import scipy.io as sio
 import numpy as np
 import torch
 import torch.multiprocessing as torch_mp
@@ -146,7 +147,7 @@ def _process_tile_predictions(
     idx_dict = {"Nuclei-INST": [0, 2], "Nuclei-TYPE": [2, 4]}  # channel starting idx
     raw_map = np.concatenate([np.array(inst_ptr), np.array(type_ptr)], axis=-1)
     inst_map, type_map = postproc.post_process(raw_map, idx_dict, "Nuclei")
-    inst_dict = HoVerNet._get_instance_info(inst_map, type_map)
+    inst_dict = HoVerNet.get_instance_info(inst_map, type_map)
     # should be rare, no nuclei detected in input images
     if len(inst_dict) == 0:
         return {}, []
@@ -379,10 +380,14 @@ class InferManager(base.InferManager):
 
     def _get_tissue_info(self):
         tissue_info = []
-        for tissue_region_id in np.unique(self.wsi_mask_lab)[1:]:
-            tissue_region = self.wsi_mask_lab == tissue_region_id
-            rmin, rmax, cmin, cmax = get_bounding_box(tissue_region)
-            tissue_info.append([rmin, rmax, cmin, cmax])
+        mask_list = np.unique(self.wsi_mask_lab).tolist()
+        if len(mask_list) > 1:
+            for tissue_region_id in mask_list[1:]:
+                tissue_region = self.wsi_mask_lab == tissue_region_id
+                rmin, rmax, cmin, cmax = get_bounding_box(tissue_region)
+                tissue_info.append([rmin, rmax, cmin, cmax])
+        else:
+            tissue_info.append([0, self.wsi_mask_lab.shape[0], 0, self.wsi_mask_lab.shape[1]])
         return tissue_info
 
     def _get_resized_map(self, mmap_path, ds_factor, read_size):
@@ -454,7 +459,6 @@ class InferManager(base.InferManager):
         locations: Union[List, np.ndarray],
         save_path: Union[str, pathlib.Path] = None,
         cache_count_path: Union[str, pathlib.Path] = None,
-        free_prediction: bool = True,
     ):
         return NucleusInstanceSegmentor.merge_prediction(
             canvas_shape,
@@ -462,7 +466,6 @@ class InferManager(base.InferManager):
             locations,
             save_path,
             cache_count_path,
-            free_prediction,
         )
 
     def _merge_inst_results(self, inst_dict, futures, has_workers=False):
@@ -524,7 +527,7 @@ class InferManager(base.InferManager):
         self.wsi_proc_shape = self.wsi_proc_shape[::-1]
         
         self.wsi_base_mag = self.wsi_handler.info.mpp # get scan resolution of WSI
-        self.wsi_base_shape = self.wsi_handler.slide_dimensions({"resolution": self.base_mag, "units": "mpp"})
+        self.wsi_base_shape = self.wsi_handler.slide_dimensions(self.wsi_base_mag, "mpp")
         self.wsi_base_shape = self.wsi_base_shape[::-1] # to YX
 
         if mask_path is not None and os.path.isfile(mask_path):
@@ -539,7 +542,7 @@ class InferManager(base.InferManager):
             cv2.imwrite(f"{self.output_dir}/mask/{wsi_basename}.png", self.wsi_mask*255)
         if self.save_thumb:
             # thumbnail at 1.25x objective magnification
-            wsi_thumb = self.slide_thumbnail(resolution=1.25, units="power") 
+            wsi_thumb = self.wsi_handler.slide_thumbnail(resolution=1.25, units="power") 
             cv2.imwrite(f"{self.output_dir}/thumb/{wsi_basename}.png", wsi_thumb)
             
         # warning, the value within this is uninitialized
@@ -615,18 +618,17 @@ class InferManager(base.InferManager):
                     patch_locations,
                     save_path=cache_raw_paths[idx],
                     cache_count_path=cache_count_paths[idx],
-                    free_prediction=True,
                 )
 
         end = time.perf_counter()
         self.logger.info("Inference Time: {0}".format(end - start))
 
         head_names = [
+            "Nuclei-INST",
+            "Nuclei-TYPE",
             "Gland-INST",
             "Gland-TYPE",
             "Lumen-INST",
-            "Nuclei-INST",
-            "Nuclei-TYPE",
             "Patch-Class",
         ]
         head_caches = list(zip(head_names, cache_raw_paths))
@@ -708,7 +710,10 @@ class InferManager(base.InferManager):
             )
             pclass_map *= lores_wsimask
             del lores_wsimask # free memory
-            cv2.imwrite("%s/tissue/%s.png" % (output_dir, wsi_basename), pclass_map)
+            sio.savemat(
+                "%s/tissue/%s.mat" % (output_dir, wsi_basename),
+                {"pclass": pclass_map}
+                )
 
         end = time.perf_counter()
         self.logger.info("Tissue Region Post Proc Time: {0}".format(end - start))
@@ -762,8 +767,9 @@ class InferManager(base.InferManager):
                                 (tile_pred_map.shape[1], tile_pred_map.shape[0]),
                                 interpolation=cv2.INTER_NEAREST,
                             )
+                        if mask_idx.ndim == 2:
                             mask_idx = np.expand_dims(mask_idx, -1)
-
+         
                         tile_pred_map *= mask_idx
                         tile_pred_list.append(tile_pred_map)
                         new_idx_dict[tissue_code + "-%s" % output_type] = [
@@ -874,6 +880,7 @@ class InferManager(base.InferManager):
         if self.save_mask:
             if not os.path.exists(self.output_dir + "/mask/"):
                 rm_n_mkdir(self.output_dir + "/mask/")
+        
 
         self.num_loader_workers = 12
         self.num_postproc_workers = 6
